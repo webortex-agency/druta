@@ -13,6 +13,7 @@ import { Logger } from './core/logger.js';
 import { ConfigManager } from './core/config.js';
 import { PluginManager } from './core/plugin.js';
 import { EventEmitter } from './core/events.js';
+import { createTemplateEngine, type TemplateEngine, type TemplateGenerationOptions } from './template/index.js';
 import type { CLIOptions, CLIContext } from './types/index.js';
 
 /**
@@ -25,6 +26,7 @@ export class DrutaCLI {
   private readonly config: ConfigManager;
   private readonly plugins: PluginManager;
   private readonly events: EventEmitter;
+  private readonly templateEngine: TemplateEngine;
   private readonly context: CLIContext;
 
   /**
@@ -45,11 +47,27 @@ export class DrutaCLI {
     this.config = new ConfigManager(this.logger);
     this.events = new EventEmitter();
     this.plugins = new PluginManager(this.events, this.logger);
-    
-    // Setup plugin directories from config defaults
     this.plugins.addPluginDirectory(join(homedir(), '.druta', 'plugins'));
-    
-    // Setup Commander.js
+    this.templateEngine = createTemplateEngine({
+      parser: {
+        templateRoot: join(process.cwd(), 'templates'),
+        cacheSize: 1000,
+        enableInheritance: true,
+        helpers: {},
+        extensions: ['.eta', '.html', '.htm', '.txt', '.md'],
+        enableProfiling: true
+      },
+      registry: {
+        localDirectories: [join(process.cwd(), 'templates')],
+        remoteRegistries: [],
+        cacheDirectory: join(homedir(), '.druta', 'cache'),
+        cacheTtl: 300000,
+        enableSecurity: true,
+        securityTimeout: 30000,
+        maxTemplateSize: 104857600,
+        enableAnalytics: true
+      }
+    }, this.logger);
     this.program = new Command();
     this.setupProgram();
     this.registerCommands();
@@ -159,36 +177,122 @@ export class DrutaCLI {
   }
 
   /**
-   * Handle generate command
+   * Handle generate command with enterprise-grade template engine
    */
-  private async handleGenerate(template: string, options: any): Promise<void> {
+  private async handleGenerate(templateName: string, options: any): Promise<void> {
     try {
-      this.logger.info(`Generating SaaS application from template: ${chalk.cyan(template)}`);
+      this.logger.info(`Generating SaaS application from template: ${templateName}`);
       
-      // Emit generation event
-      await this.events.emit('generate:start', { template, options });
+      // Load plugins first
+      await this.plugins.loadAll();
       
-      // TODO: Implement template generation logic
-      this.logger.success('Generation completed successfully!');
+      // Emit generation start event
+      await this.events.emit('generate:start', {
+        template: templateName,
+        options
+      });
       
-      await this.events.emit('generate:complete', { template, options });
-    } catch (error) {
-      this.logger.error('Generation failed:', error);
+      // Prepare template generation options
+      const generationOptions: TemplateGenerationOptions = {
+        template: templateName,
+        outputDir: options.output || './generated-app',
+        variables: options.variables || {},
+        environment: options.environment || 'development',
+        force: options.force || false,
+        dryRun: options.dryRun || false,
+        verbose: options.verbose || false
+      };
+      
+      // Generate using enterprise template engine
+      const result = await this.templateEngine.generateFromTemplate(generationOptions);
+      
+      if (result.status === 'success') {
+        this.logger.success('Generation completed successfully!');
+        this.logger.info(`Generated ${result.processing.totalFiles} files in ${result.generationTime.toFixed(2)}ms`);
+        this.logger.info(`Output directory: ${result.outputDir}`);
+        
+        // Log performance metrics if verbose
+        if (options.verbose) {
+          const metrics = result.metrics;
+          this.logger.info('Performance Metrics:', {
+            templateResolutionTime: `${metrics.templateResolutionTime.toFixed(2)}ms`,
+            variableResolutionTime: `${metrics.variableResolutionTime.toFixed(2)}ms`,
+            fileProcessingTime: `${metrics.fileProcessingTime.toFixed(2)}ms`,
+            throughput: `${result.processing.metrics.throughput.toFixed(2)} files/sec`,
+            memoryUsage: `${metrics.memoryUsage.toFixed(2)}MB`
+          });
+        }
+      } else {
+        this.logger.error(`Generation failed: ${result.error}`);
+        if (result.processing.errorCount > 0) {
+          this.logger.warn(`${result.processing.errorCount} files failed to process`);
+        }
+      }
+      
+      // Emit generation complete event
+      await this.events.emit('generate:complete', {
+        template: templateName,
+        result,
+        options
+      });
+      
+    } catch (error: any) {
+      this.logger.error(`Generation failed: ${error.message}`);
+      await this.events.emit('generate:error', {
+        template: templateName,
+        error
+      });
       throw error;
     }
   }
 
   /**
-   * Handle list command
+   * Handle list command with enterprise template registry
    */
   private async handleList(options: any): Promise<void> {
     try {
       this.logger.info('Available templates:');
-      // TODO: Implement template listing logic
       
-      await this.events.emit('list:complete', { options });
-    } catch (error) {
-      this.logger.error('Failed to list templates:', error);
+      // Load plugins first
+      await this.plugins.loadAll();
+      
+      // Emit list event
+      await this.events.emit('list:start', { options });
+      
+      // Get templates from enterprise registry
+      const templates = await this.templateEngine.listTemplates({
+        category: options.category,
+        author: options.author,
+        includeRemote: options.remote || false
+      });
+      
+      if (templates.length === 0) {
+        this.logger.info('No templates found. Add templates to get started.');
+      } else {
+        this.logger.info(`Found ${templates.length} template(s):`);
+        
+        for (const template of templates) {
+          this.logger.info(`  ${template.name}@${template.version} - ${template.description}`);
+          if (options.verbose) {
+            this.logger.info(`    Author: ${template.author}`);
+            this.logger.info(`    Category: ${template.category}`);
+            this.logger.info(`    License: ${template.license}`);
+            if (template.keywords.length > 0) {
+              this.logger.info(`    Keywords: ${template.keywords.join(', ')}`);
+            }
+            if (template.downloads) {
+              this.logger.info(`    Downloads: ${template.downloads}`);
+            }
+            if (template.rating) {
+              this.logger.info(`    Rating: ${template.rating}/5`);
+            }
+          }
+        }
+      }
+      
+      await this.events.emit('list:complete', { templates, options });
+    } catch (error: any) {
+      this.logger.error(`Failed to list templates: ${error.message}`);
       throw error;
     }
   }
